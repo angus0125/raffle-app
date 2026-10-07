@@ -1,0 +1,425 @@
+import { useMemo, useRef, useState } from 'react';
+import * as XLSX from 'xlsx';
+import { jsPDF } from 'jspdf';
+
+const normalizeName = (value) =>
+  String(value ?? '')
+    .trim()
+    .replace(/\s+/g, ' ')
+    .toLowerCase();
+
+const createPrize = (name = '', count = 1, allowRepeat = false) => ({
+  id: crypto.randomUUID(),
+  name,
+  count,
+  allowRepeat,
+});
+
+const parseParticipantNames = (rows) => {
+  const names = new Set();
+  const candidateValues = [];
+
+  rows.forEach((row) => {
+    if (!row || typeof row !== 'object') return;
+
+    Object.entries(row).forEach(([key, value]) => {
+      if (value === null || value === undefined) return;
+      const text = String(value).trim();
+      if (!text) return;
+      const lower = text.toLowerCase();
+      if (['name', '姓名', '名稱', 'participant', 'participants', 'member', 'members'].includes(lower)) {
+        return;
+      }
+      candidateValues.push(text);
+    });
+  });
+
+  candidateValues
+    .map((name) => name.trim())
+    .filter(Boolean)
+    .forEach((name) => names.add(name));
+
+  return [...names];
+};
+
+const shuffleArray = (items) => {
+  const copy = [...items];
+  for (let i = copy.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [copy[i], copy[j]] = [copy[j], copy[i]];
+  }
+  return copy;
+};
+
+const parseListText = (text) =>
+  text
+    .split(/\n|,|；|、/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+
+function App() {
+  const fileInputRef = useRef(null);
+
+  const [prizes, setPrizes] = useState([
+    createPrize('頭獎', 1, false),
+    createPrize('二獎', 3, false),
+    createPrize('三獎', 5, true),
+  ]);
+  const [participants, setParticipants] = useState([]);
+  const [uploadedFileName, setUploadedFileName] = useState('');
+  const [winnerMap, setWinnerMap] = useState({});
+  const [showHiddenConfig, setShowHiddenConfig] = useState(false);
+  const [whitelistText, setWhitelistText] = useState('');
+  const [blacklistText, setBlacklistText] = useState('');
+
+  const whitelistNames = useMemo(
+    () => parseListText(whitelistText).map((name) => normalizeName(name)),
+    [whitelistText]
+  );
+
+  const blacklistNames = useMemo(
+    () => parseListText(blacklistText).map((name) => normalizeName(name)),
+    [blacklistText]
+  );
+
+  const validParticipantCount = useMemo(
+    () => participants.filter((name) => !blacklistNames.includes(normalizeName(name))).length,
+    [participants, blacklistNames]
+  );
+
+  const totalPrizeSlots = prizes.reduce((sum, prize) => sum + Math.max(0, Number(prize.count) || 0), 0);
+
+  const updatePrize = (id, key, value) => {
+    setPrizes((prev) =>
+      prev.map((prize) =>
+        prize.id === id ? { ...prize, [key]: value } : prize
+      )
+    );
+  };
+
+  const addPrize = () => {
+    setPrizes((prev) => [...prev, createPrize(`獎項 ${prev.length + 1}`, 1, false)]);
+  };
+
+  const removePrize = (id) => {
+    setPrizes((prev) => (prev.length > 1 ? prev.filter((prize) => prize.id !== id) : prev));
+  };
+
+  const handleFileUpload = async (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    try {
+      const data = await file.arrayBuffer();
+      const workbook = XLSX.read(data, { type: 'array' });
+      const rows = [];
+
+      workbook.SheetNames.forEach((sheetName) => {
+        const worksheet = workbook.Sheets[sheetName];
+        const jsonRows = XLSX.utils.sheet_to_json(worksheet, { defval: '', raw: false });
+        rows.push(...jsonRows);
+      });
+
+      const names = parseParticipantNames(rows);
+      setParticipants(names);
+      setUploadedFileName(file.name);
+      setWinnerMap({});
+    } catch (error) {
+      window.alert('檔案讀取失敗，請確認是 Excel 或 CSV 檔案。');
+      console.error(error);
+    } finally {
+      if (fileInputRef.current) {
+        fileInputRef.current.value = '';
+      }
+    }
+  };
+
+  const drawRaffle = () => {
+    if (!participants.length) {
+      window.alert('請先上傳 Excel 名單');
+      return;
+    }
+
+    const blacklistSet = new Set(blacklistNames);
+    const whitelistSet = new Set(whitelistNames);
+    const used = new Set();
+    const results = {};
+
+    const eligiblePool = participants.filter(
+      (name) => !blacklistSet.has(normalizeName(name))
+    );
+
+    prizes.forEach((prize, prizeIndex) => {
+      const count = Math.max(0, Number(prize.count) || 0);
+      if (count === 0) {
+        results[prize.id] = [];
+        return;
+      }
+
+      let pool = eligiblePool.filter((name) => prize.allowRepeat || !used.has(normalizeName(name)));
+
+      if (prizeIndex === 0 && whitelistSet.size > 0) {
+        const preferred = pool.filter((name) => whitelistSet.has(normalizeName(name)));
+        if (preferred.length > 0) {
+          pool = preferred;
+        }
+      }
+
+      const winners = [];
+
+      for (let i = 0; i < count; i += 1) {
+        if (pool.length === 0) break;
+
+        const shuffled = shuffleArray(pool);
+        const selected = shuffled[0];
+        const selectedKey = normalizeName(selected);
+        winners.push(selected);
+
+        if (!prize.allowRepeat) {
+          used.add(selectedKey);
+        }
+
+        pool = pool.filter((name) => normalizeName(name) !== selectedKey || prize.allowRepeat);
+      }
+
+      results[prize.id] = winners;
+    });
+
+    setWinnerMap(results);
+  };
+
+  const exportPdf = () => {
+    if (!Object.keys(winnerMap).length) {
+      window.alert('請先完成抽獎');
+      return;
+    }
+
+    const pdf = new jsPDF({ unit: 'pt', format: 'a4' });
+    const width = pdf.internal.pageSize.getWidth();
+    let y = 58;
+
+    pdf.setFillColor(11, 17, 29);
+    pdf.rect(0, 0, width, pdf.internal.pageSize.getHeight(), 'F');
+    pdf.setTextColor(234, 240, 255);
+    pdf.setFontSize(24);
+    pdf.text('抽獎結果', 40, 52);
+
+    prizes.forEach((prize) => {
+      const winners = winnerMap[prize.id] || [];
+
+      if (y > 700) {
+        pdf.addPage();
+        y = 58;
+      }
+
+      pdf.setFontSize(16);
+      pdf.text(`${prize.name}（${prize.count} 名）`, 40, y);
+      y += 26;
+
+      if (winners.length === 0) {
+        pdf.setFontSize(12);
+        pdf.text('• 無', 52, y);
+        y += 24;
+        return;
+      }
+
+      winners.forEach((winner) => {
+        pdf.setFontSize(12);
+        pdf.text(`• ${winner}`, 52, y);
+        y += 20;
+      });
+    });
+
+    pdf.save('raffle-results.pdf');
+  };
+
+  useEffect(() => {
+    const onKeyDown = (event) => {
+      if (event.altKey && event.shiftKey && event.key.toLowerCase() === 'w') {
+        setShowHiddenConfig((prev) => !prev);
+      }
+    };
+
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, []);
+
+  const summaryText = participants.length
+    ? `${participants.length} 筆資料 • ${validParticipantCount} 位可抽獎`
+    : '尚未上傳資料';
+
+  return (
+    <div className="app-shell">
+      <header className="glass-panel app-header">
+        <div>
+          <p className="eyebrow">Raffle Studio</p>
+          <h1>Liquid Glass 抽獎器</h1>
+        </div>
+        <button className="ghost-button" onClick={() => setShowHiddenConfig((prev) => !prev)}>
+          高級設定
+        </button>
+      </header>
+
+      <main className="layout-grid">
+        <section className="glass-panel left-panel">
+          <div className="section-header">
+            <h2>獎項設定</h2>
+            <button className="mini-button" onClick={addPrize}>+ 新增</button>
+          </div>
+
+          <div className="prize-list">
+            {prizes.map((prize, index) => (
+              <div className="prize-card" key={prize.id}>
+                <div className="prize-top-row">
+                  <span className="step-tag">獎項 {index + 1}</span>
+                  {prizes.length > 1 && (
+                    <button className="x-button" onClick={() => removePrize(prize.id)} aria-label="刪除獎項">
+                      ×
+                    </button>
+                  )}
+                </div>
+
+                <label>
+                  獎項名稱
+                  <input
+                    value={prize.name}
+                    onChange={(event) => updatePrize(prize.id, 'name', event.target.value)}
+                    placeholder="例如：頭獎"
+                  />
+                </label>
+
+                <div className="inline-fields">
+                  <label>
+                    得獎人數
+                    <input
+                      type="number"
+                      min="1"
+                      value={prize.count}
+                      onChange={(event) =>
+                        updatePrize(prize.id, 'count', Math.max(1, Number(event.target.value) || 1))
+                      }
+                    />
+                  </label>
+
+                  <label className="switch-row">
+                    <input
+                      type="checkbox"
+                      checked={prize.allowRepeat}
+                      onChange={(event) => updatePrize(prize.id, 'allowRepeat', event.target.checked)}
+                    />
+                    可重複得獎
+                  </label>
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <section className="glass-panel right-panel">
+          <div className="section-header">
+            <h2>名單資料</h2>
+            <label className="upload-button">
+              <input type="file" accept=".xls,.xlsx,.csv" ref={fileInputRef} onChange={handleFileUpload} />
+              上傳 Excel
+            </label>
+          </div>
+
+          <div className="stats-row">
+            <div className="stat-box">
+              <span>名單數</span>
+              <strong>{participants.length}</strong>
+            </div>
+            <div className="stat-box">
+              <span>總席次</span>
+              <strong>{totalPrizeSlots}</strong>
+            </div>
+            <div className="stat-box accent">
+              <span>可抽人數</span>
+              <strong>{validParticipantCount}</strong>
+            </div>
+          </div>
+
+          <div className="file-meta">
+            <span>{uploadedFileName || '尚未上傳檔案'}</span>
+            <span>{summaryText}</span>
+          </div>
+
+          <div className="participant-preview">
+            {participants.length ? (
+              participants.slice(0, 16).map((name) => (
+                <span key={name} className="chip">
+                  {name}
+                </span>
+              ))
+            ) : (
+              <p className="empty-text">上傳 Excel 後，系統會自動整理名單並顯示於此</p>
+            )}
+          </div>
+
+          <div className="action-row">
+            <button className="primary-button" onClick={drawRaffle}>
+              開始抽獎
+            </button>
+            <button className="secondary-button" onClick={exportPdf} disabled={!Object.keys(winnerMap).length}>
+              匯出 PDF
+            </button>
+          </div>
+        </section>
+      </main>
+
+      {showHiddenConfig && (
+        <section className="glass-panel debug-panel">
+          <div className="section-header">
+            <h2>隱藏設定</h2>
+            <button className="ghost-button small" onClick={() => setShowHiddenConfig(false)}>
+              關閉
+            </button>
+          </div>
+
+          <div className="debug-grid">
+            <label>
+              白名單（優先出現在第一獎）
+              <textarea
+                value={whitelistText}
+                onChange={(event) => setWhitelistText(event.target.value)}
+                placeholder="例如：張三、李四\n王五"
+              />
+            </label>
+
+            <label>
+              黑名單（排除任何獎項）
+              <textarea
+                value={blacklistText}
+                onChange={(event) => setBlacklistText(event.target.value)}
+                placeholder="例如：王小明\n陳二\nOOO"
+              />
+            </label>
+          </div>
+        </section>
+      )}
+
+      <section className="glass-panel results-panel">
+        <div className="section-header">
+          <h2>得獎名單</h2>
+        </div>
+
+        <div className="result-grid">
+          {prizes.map((prize) => (
+            <article className="result-card" key={prize.id}>
+              <h3>{prize.name}</h3>
+              <ul>
+                {(winnerMap[prize.id] || []).length ? (
+                  winnerMap[prize.id].map((winner) => <li key={`${prize.id}-${winner}`}>{winner}</li>)
+                ) : (
+                  <li className="empty-result">尚未抽出</li>
+                )}
+              </ul>
+            </article>
+          ))}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+export default App;
